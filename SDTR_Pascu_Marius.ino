@@ -17,7 +17,7 @@ const String urlGet = "/marius.index/_search/";
 const String urlDelete = "/marius.index/_delete_by_query/";
 const char *host = "8f9677360fc34e2eb943d737b2597c7b.us-east-1.aws.found.io";
 const int httpsPort = 9243;
-const String userpass = "elastic:AWbtmGda2Q7BI2bYpdjyF4qd"; // format user:pass
+const String userpass = "******"; // format user:pass
 
 ////Variables for cloud////
 String coltrolFood_e = "";

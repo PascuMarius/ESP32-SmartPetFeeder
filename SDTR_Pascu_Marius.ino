@@ -1,6 +1,6 @@
 ////Pins Definition////
 #define relayPin 1
-#define waterSensorPin 1
+#define waterSensorPin 35
 #define scalePin0 16     // 16 - yellow wire
 #define scalePin1 17     // 17 - orange wire 
 
@@ -17,11 +17,10 @@ const String urlGet = "/marius.index/_search/";
 const String urlDelete = "/marius.index/_delete_by_query/";
 const char *host = "8f9677360fc34e2eb943d737b2597c7b.us-east-1.aws.found.io";
 const int httpsPort = 9243;
-const String userpass = "CONFIDENTIAL"; // format user:pass
+const String userpass = "CREDENTIALS"; // format user:pass
 
 ////Variables for cloud////
 String controlFood_e = "done";
-String controlWater_e = "";
 int food_weight = 0;
 int waterLevel = 0;
 int selectedFood = 0;
@@ -33,14 +32,12 @@ HX711 scale;
 float calibration_factor = 1899; 
 float units;
 
-// define two tasks for Elastic & AnalogRead
-void TaskElastic( void *pvParameters );
-void TaskAnalogReadA3( void *pvParameters );
-
 #include "WiFi.h"
 const char* ssid = "Net slab 2g";
 const char* password = "prahova6net";
 
+SemaphoreHandle_t xScaleSemaphore;  // semaphore to synchronize ElasticTask and ScaleTask
+SemaphoreHandle_t xTaskSemaphore;   // semaphore to synchronize ElasticTask and WaterControlTask
 
 void setup() {
   WiFi.mode(WIFI_STA);
@@ -74,6 +71,9 @@ void setup() {
   Serial.print("Zero factor: "); 
   Serial.println(zero_factor);
 
+    xScaleSemaphore = xSemaphoreCreateBinary(); 
+    xTaskSemaphore = xSemaphoreCreateBinary();
+    
     //////Create aditional Tasks for Core 0//////
     xTaskCreatePinnedToCore(
         TaskElastic, /* Task function.                            */
@@ -84,7 +84,15 @@ void setup() {
         NULL,        /* Task handle to keep track of created task */
         0            /* Core                                      */
     );
-
+    xTaskCreatePinnedToCore(
+        TaskReadWaterLevel, /* Task function.                            */
+        "Task3",            /* name of task.                             */
+        1024 * 7,           /* Stack size of task                        */
+        NULL,               /* parameter of the task                     */
+        1,                  /* priority of the task                      */
+        NULL,               /* Task handle to keep track of created task */
+        0                   /* Core                                      */
+    );
     xTaskCreatePinnedToCore(
         TaskReadScale, /* Task function.                            */
         "Task2",       /* name of task.                             */
@@ -95,22 +103,12 @@ void setup() {
         0              /* Core                                      */
     );  
 
-    xTaskCreatePinnedToCore(
-        TaskReadWaterLevel, /* Task function.                            */
-        "Task3",            /* name of task.                             */
-        1024 * 7,           /* Stack size of task                        */
-        NULL,               /* parameter of the task                     */
-        1,                  /* priority of the task                      */
-        NULL,               /* Task handle to keep track of created task */
-        0                   /* Core                                      */
-    );
+   xSemaphoreGive(xTaskSemaphore);
 }
-
 void loop()
 {
   // Empty. Things are done in Tasks.
 }
-
 /*--------------------------------------------------*/
 /*---------------------- Tasks ---------------------*/
 /*--------------------------------------------------*/
@@ -120,11 +118,12 @@ void TaskElastic(void *pvParameters)  // This is a task for CLOUD processing dat
   (void) pvParameters;
   for (;;) // A Task shall never return or exit.
   {
-    vTaskDelay(1000);
+    vTaskDelay(1);
+    xSemaphoreTake(xTaskSemaphore, portMAX_DELAY);
     String request = getRequest();  
     JsonArray response = parseResponse(request);
     handleEvents(response);
-
+    xSemaphoreGive(xTaskSemaphore);
   }
 }
 
@@ -161,7 +160,7 @@ String getRequest()
   Serial.println(getResponse);
   client.stop();
   return getResponse;
-  }
+}
 
 //////Function that parse the response from the server//////
 JsonArray parseResponse(String response){
@@ -186,16 +185,14 @@ void handleEvents(JsonArray events){
        if( isCurrentTime(oneEvent) ){
           Serial.println("CurrentTime match eventTime");
           setConfiguration(oneEvent);
-          //event = "start";
-          //controlFood(selectedFood);
-          //controlWater();
+          xSemaphoreGive(xScaleSemaphore);   // give semaphore to scale task
           const char* Once = "Once";
           const char* repeat = oneEvent["_source"]["repeat"].as<const char*>();
-          vTaskDelay(200);
+          
           if(strcmp (repeat, Once) == 0){
             postDelete(oneEvent["_id"].as<const char*>());
           }
-          vTaskDelay(200);
+          xSemaphoreTake(xScaleSemaphore,portMAX_DELAY);   // wait for scale task to finish measures
           postDone();
           break;
         }
@@ -274,6 +271,7 @@ void postDelete(const char* id){
   {
     Serial.println("connection failed: " + x);
   }
+  Serial.println(docDelete);
   String httpDelete = String("POST ") + urlDelete + " HTTP/1.1\r\n" +
                     "Host: " + host + "\r\n" +
                     "User-Agent: esp32pet\r\n" +
@@ -291,7 +289,7 @@ void postDelete(const char* id){
 void postDone()
 {
   String docDone = "{\"timestamp\":\"" + getDate() + "\"," +
-                   "\"event\":\"" + controlFood_e + "\"," +
+                   "\"event\":\"" + "done" + "\"," +
                    "\"food_weight[g]\":" + food_weight + "," +
                    "\"water_level\":\"" + translateWaterLevel(waterLevel) + "\"" + "}";
   WiFiClientSecure client;
@@ -339,11 +337,16 @@ void TaskReadWaterLevel(void *pvParameters)  // This is the second task made for
 
   while (1)
   {
-    vTaskDelay(1000);
-    Serial.println("Task TaskReadWaterLevel");
-    if(controlWater_e == "start"){
-      controlWater();
-      }
+   vTaskDelay(1);  // check if water needs control each minute
+   if(xSemaphoreTake(xTaskSemaphore, 5000)) // control water every time elastic task is done or at every 5 secs.
+   {
+     controlWater(); 
+     xSemaphoreGive(xTaskSemaphore);
+   }
+   else
+   {
+     controlWater(); 
+   }
   }
 }
 //////Function that control the water level using pump and the water level sensor//////
@@ -352,12 +355,11 @@ void controlWater()
   if (selectedWater == 0)
     selectedWater = 1;
   measureWater();
-  while (waterLevel < selectedWater)
+  if (waterLevel < selectedWater)
   {
     digitalWrite(relayPin, HIGH);  // open pump
     measureWater();
-    vTaskDelay(50);
-  }
+  }else
   digitalWrite(relayPin, LOW); // close pump
 }
 void measureWater()
@@ -369,8 +371,8 @@ void measureWater()
     value = value + analogRead(waterSensorPin);
   }
   int averageRead = value / 50;
-  Serial.print("Water level sensor measured value: ");
-  Serial.print(averageRead);Serial.println();
+  //Serial.print("Water level sensor measured value: ");
+  //Serial.print(averageRead);Serial.println();
   if (averageRead <= 88)
   {
     waterLevel = 0;
@@ -408,21 +410,19 @@ String translateWaterLevel(int level){
 void TaskReadScale(void *pvParameters)  //This is the third task made for scale
 {
   (void) pvParameters;
-
   while (1)
   {
-    vTaskDelay(1000);
-    Serial.println("Task TaskReadScale");
-    if(controlFood_e == "start"){
-      controlFood(selectedFood);
-      }
+    vTaskDelay(1);
+    xSemaphoreTake(xScaleSemaphore,portMAX_DELAY);
+    controlFood();
+    xSemaphoreGive(xScaleSemaphore);
   }
 }
 //////Function used to control the food using the scale//////
-void controlFood(int selectedWeight)
+void controlFood()
 {
-  float units;
-  while (controlFood_e == "start")
+  float units = 0;
+  while (units <= selectedFood) // units <= selectedFood
   {
     scale.set_scale(calibration_factor);  //Adjust scale to calibration factor value
     // Calculate the new value in grams
@@ -431,12 +431,9 @@ void controlFood(int selectedWeight)
     if (units < 0){
       units = 0.00;
     }
-    if (units >= selectedWeight){
-      food_weight = int(units);
-      controlFood_e = "done";
-      vTaskDelay(100);
-    }
+    food_weight = int(units);
     Serial.print(units);
     Serial.print(" grams");Serial.println();
+    vTaskDelay(50);
   }
 }

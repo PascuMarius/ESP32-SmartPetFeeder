@@ -17,7 +17,7 @@ const String urlGet = "/marius.index/_search/";
 const String urlDelete = "/marius.index/_delete_by_query/";
 const char *host = "8f9677360fc34e2eb943d737b2597c7b.us-east-1.aws.found.io";
 const int httpsPort = 9243;
-const String userpass = "CREDENTIALS"; // format user:pass
+const String userpass = "CREDENTIALE"; // format user:pass
 
 ////Variables for cloud////
 String controlFood_e = "done";
@@ -36,8 +36,8 @@ float units;
 const char* ssid = "Net slab 2g";
 const char* password = "prahova6net";
 
-SemaphoreHandle_t xScaleSemaphore;  // semaphore to synchronize ElasticTask and ScaleTask
-SemaphoreHandle_t xTaskSemaphore;   // semaphore to synchronize ElasticTask and WaterControlTask
+SemaphoreHandle_t xFoodSemaphore;  // semaphore to synchronize ElasticTask and ScaleTask
+SemaphoreHandle_t xWaterSemaphore;  // semaphore to synchronize ElasticTask and ScaleTask
 
 void setup() {
   WiFi.mode(WIFI_STA);
@@ -71,8 +71,8 @@ void setup() {
   Serial.print("Zero factor: "); 
   Serial.println(zero_factor);
 
-    xScaleSemaphore = xSemaphoreCreateBinary(); 
-    xTaskSemaphore = xSemaphoreCreateBinary();
+    xFoodSemaphore  = xSemaphoreCreateBinary(); 
+    xWaterSemaphore = xSemaphoreCreateBinary(); 
     
     //////Create aditional Tasks for Core 0//////
     xTaskCreatePinnedToCore(
@@ -102,8 +102,7 @@ void setup() {
         NULL,          /* Task handle to keep track of created task */
         0              /* Core                                      */
     );  
-
-   xSemaphoreGive(xTaskSemaphore);
+  xSemaphoreGive(xWaterSemaphore);
 }
 void loop()
 {
@@ -118,12 +117,11 @@ void TaskElastic(void *pvParameters)  // This is a task for CLOUD processing dat
   (void) pvParameters;
   for (;;) // A Task shall never return or exit.
   {
-    vTaskDelay(1);
-    xSemaphoreTake(xTaskSemaphore, portMAX_DELAY);
     String request = getRequest();  
     JsonArray response = parseResponse(request);
     handleEvents(response);
-    xSemaphoreGive(xTaskSemaphore);
+    vTaskDelay(100);
+    
   }
 }
 
@@ -155,7 +153,7 @@ String getRequest()
       getResponse = client.readStringUntil('\n');
     }
   }
- // lineGet = client.readStringUntil('\r\n\r\n');
+
   Serial.println("Reply was:");
   Serial.println(getResponse);
   client.stop();
@@ -185,14 +183,13 @@ void handleEvents(JsonArray events){
        if( isCurrentTime(oneEvent) ){
           Serial.println("CurrentTime match eventTime");
           setConfiguration(oneEvent);
-          xSemaphoreGive(xScaleSemaphore);   // give semaphore to scale task
+          xSemaphoreGive(xFoodSemaphore);   // give semaphore to scale task
           const char* Once = "Once";
           const char* repeat = oneEvent["_source"]["repeat"].as<const char*>();
-          
           if(strcmp (repeat, Once) == 0){
             postDelete(oneEvent["_id"].as<const char*>());
           }
-          xSemaphoreTake(xScaleSemaphore,portMAX_DELAY);   // wait for scale task to finish measures
+          xSemaphoreTake(xFoodSemaphore,portMAX_DELAY);   // wait for scale task to finish measures
           postDone();
           break;
         }
@@ -247,13 +244,21 @@ void setConfiguration(JsonVariant event) {
   selectedFood = setFoodWeight;
   const char* setWaterLevel = event["_source"]["setWaterLevel"].as<const char*>();
   if(setWaterLevel == "Empty"){
+     xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
      selectedWater = 0;
+     xSemaphoreGive(xWaterSemaphore);
     }else if(setWaterLevel == "Low"){
+            xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
             selectedWater = 1;
+            xSemaphoreGive(xWaterSemaphore);
       }else if(setWaterLevel == "Medium"){
+              xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
               selectedWater = 2;
+              xSemaphoreGive(xWaterSemaphore);
         }else if(setWaterLevel == "High"){
+                xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
                 selectedWater = 3;
+                xSemaphoreGive(xWaterSemaphore);
           }
   const char* repeat = event["_source"]["repeat"].as<const char*>();   
   Serial.printf("setConfiguration repeat: %s\n", repeat);
@@ -288,10 +293,12 @@ void postDelete(const char* id){
 //////Function that makes a POST request with measured data//////
 void postDone()
 {
+  xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
   String docDone = "{\"timestamp\":\"" + getDate() + "\"," +
                    "\"event\":\"" + "done" + "\"," +
                    "\"food_weight[g]\":" + food_weight + "," +
                    "\"water_level\":\"" + translateWaterLevel(waterLevel) + "\"" + "}";
+ xSemaphoreGive(xWaterSemaphore);
   WiFiClientSecure client;
   Serial.print("Connecting to Cloud at: ");
   Serial.println(host);
@@ -337,30 +344,30 @@ void TaskReadWaterLevel(void *pvParameters)  // This is the second task made for
 
   while (1)
   {
-   vTaskDelay(1);  // check if water needs control each minute
-   if(xSemaphoreTake(xTaskSemaphore, 5000)) // control water every time elastic task is done or at every 5 secs.
-   {
      controlWater(); 
-     xSemaphoreGive(xTaskSemaphore);
-   }
-   else
-   {
-     controlWater(); 
-   }
+     vTaskDelay(1000);
   }
 }
 //////Function that control the water level using pump and the water level sensor//////
 void controlWater()
 {
+  xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
   if (selectedWater == 0)
     selectedWater = 1;
+  xSemaphoreGive(xWaterSemaphore);
   measureWater();
+  vTaskDelay(10);
+  xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
   if (waterLevel < selectedWater)
   {
+    xSemaphoreGive(xWaterSemaphore);
     digitalWrite(relayPin, HIGH);  // open pump
     measureWater();
   }else
-  digitalWrite(relayPin, LOW); // close pump
+  {
+    xSemaphoreGive(xWaterSemaphore);
+    digitalWrite(relayPin, LOW); // close pump
+  }
 }
 void measureWater()
 {
@@ -371,39 +378,47 @@ void measureWater()
     value = value + analogRead(waterSensorPin);
   }
   int averageRead = value / 50;
-  //Serial.print("Water level sensor measured value: ");
-  //Serial.print(averageRead);Serial.println();
   if (averageRead <= 88)
   {
+    xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
     waterLevel = 0;
+    xSemaphoreGive(xWaterSemaphore);
   }
   if (averageRead > 88 && averageRead <= 190)
   {
+    xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
     waterLevel = 1;
+    xSemaphoreGive(xWaterSemaphore);
   }
   if (averageRead > 190 && averageRead <= 240)
   {
+    xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
     waterLevel = 2;
+    xSemaphoreGive(xWaterSemaphore);
   }
   if (averageRead > 240)
   {
+    xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
     waterLevel = 3;
+    xSemaphoreGive(xWaterSemaphore);
   }
+  xSemaphoreTake(xWaterSemaphore, portMAX_DELAY);
   Serial.print("Current water level(0..3): ");
   Serial.print(waterLevel);Serial.println();
+  xSemaphoreGive(xWaterSemaphore);
 }
 
 String translateWaterLevel(int level){
   String water_level = "";
   if(level == 0){
-   water_level = "Empty";
+    water_level = "Empty";
   }else if(level == 1){
-    water_level = "Low";
+     water_level = "Low";
       }else if(level == 2){
-      water_level = "Medium";
+       water_level = "Medium";
         }else if(level == 3){
-        water_level = "High";
-          }
+         water_level = "High";
+        }
           return water_level;
 }
 
@@ -412,10 +427,10 @@ void TaskReadScale(void *pvParameters)  //This is the third task made for scale
   (void) pvParameters;
   while (1)
   {
-    vTaskDelay(1);
-    xSemaphoreTake(xScaleSemaphore,portMAX_DELAY);
+    xSemaphoreTake(xFoodSemaphore,portMAX_DELAY);
     controlFood();
-    xSemaphoreGive(xScaleSemaphore);
+    xSemaphoreGive(xFoodSemaphore);
+    vTaskDelay(100);
   }
 }
 //////Function used to control the food using the scale//////
@@ -434,6 +449,6 @@ void controlFood()
     food_weight = int(units);
     Serial.print(units);
     Serial.print(" grams");Serial.println();
-    vTaskDelay(50);
+    vTaskDelay(55);
   }
 }
